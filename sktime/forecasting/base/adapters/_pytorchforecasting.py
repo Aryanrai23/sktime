@@ -174,6 +174,21 @@ class _PytorchForecastingAdapter(_BaseGlobalForecaster):
         random_log_dir = os.getcwd() + "/lightning_logs/" + str(abs(random_num))
         return random_log_dir
 
+    def _filter_total_levels(self, y):
+        """Filter out '__total' levels from hierarchical data."""
+        if not isinstance(y.index, pd.MultiIndex):
+            return y
+
+        # Get all levels except the last one (time)
+        non_time_levels = y.index.names[:-1]
+
+        # Create a mask for rows that don't contain '__total'
+        mask = pd.Series(True, index=y.index)
+        for level in non_time_levels:
+            mask &= y.index.get_level_values(level) != "__total"
+
+        return y[mask]
+
     def _fit(
         self: "_PytorchForecastingAdapter",
         y: pd.DataFrame,
@@ -182,26 +197,27 @@ class _PytorchForecastingAdapter(_BaseGlobalForecaster):
     ) -> "_PytorchForecastingAdapter":
         """Fit forecaster to training data.
 
-        private _fit containing the core logic, called from fit
-
-        Writes to self:
-            Sets fitted model attributes ending in "_".
-
         Parameters
         ----------
-        y : sktime time series object
-            guaranteed to have a single column/variable
-        fh : guaranteed to be ForecastingHorizon
+        y : pd.DataFrame
+            Target time series to which to fit the forecaster.
+        fh : ForecastingHorizon
             The forecasting horizon with the steps ahead to to predict.
-        X : sktime time series object, optional (default=None)
-            guaranteed to have at least one column/variable
-            Exogeneous time series to fit to.
+        X : pd.DataFrame, optional (default=None)
+            Exogenous variables are ignored.
 
         Returns
         -------
-        self : _PytorchForecastingAdapter
-            reference to self
+        self : returns an instance of self.
         """
+        # Store original data for prediction
+        self._y = y
+        self._X = X
+
+        # Filter out '__total' levels before training
+        y_filtered = self._filter_total_levels(y)
+        X_filtered = self._filter_total_levels(X) if X is not None else None
+
         self._max_prediction_length = np.max(fh.to_relative(self.cutoff))
         if not fh.is_all_out_of_sample(self.cutoff):
             raise NotImplementedError(
@@ -209,10 +225,10 @@ class _PytorchForecastingAdapter(_BaseGlobalForecaster):
             )
         # check if dummy X is needed
         # only the TFT model need X to fit, probably a bug in pytorch-forecasting
-        X = self._dummy_X(X, y)
+        X_filtered = self._dummy_X(X_filtered, y_filtered)
         # convert series to frame
-        _y, self._convert_to_series = _series_to_frame(y)
-        _X, _ = _series_to_frame(X)
+        _y, self._convert_to_series = _series_to_frame(y_filtered)
+        _X, _ = _series_to_frame(X_filtered)
         # convert data to pytorch-forecasting datasets
         training, validation = self._Xy_to_dataset(
             _X, _y, self._dataset_params, self._max_prediction_length
@@ -254,51 +270,26 @@ class _PytorchForecastingAdapter(_BaseGlobalForecaster):
     ) -> pd.Series:
         """Forecast time series at future horizon.
 
-        private _predict containing the core logic, called from predict
-
-        State required:
-            Requires state to be "fitted".
-
-        Accesses in self:
-            Fitted model attributes ending in "_"
-            self.cutoff
-
         Parameters
         ----------
-        fh : guaranteed to be ForecastingHorizon or None, optional (default=None)
+        fh : ForecastingHorizon or None, optional (default=None)
             The forecasting horizon with the steps ahead to to predict.
-        X : sktime time series object, optional (default=None)
-            guaranteed to be of an mtype in self.get_tag("X_inner_mtype")
-            Exogeneous time series for the forecast
-            If ``y`` is not passed (not performing global forecasting), ``X`` should
-            only contain the time points to be predicted.
-            If ``y`` is passed (performing global forecasting), ``X`` must contain
-            all historical values and the time points to be predicted.
-        y : sktime time series object, optional (default=None)
+        X : pd.DataFrame, optional (default=None)
+            Exogenous variables for the forecast
+        y : pd.DataFrame, optional (default=None)
             Historical values of the time series that should be predicted.
-            If not None, global forecasting will be performed.
-            Only pass the historical values not the time points to be predicted.
 
         Returns
         -------
-        y_pred : sktime time series object
-            guaranteed to have a single column/variable
+        pd.Series
             Point predictions
-
-        Notes
-        -----
-        If ``y`` is not None, global forecast will be performed.
-        In global forecast mode,
-        ``X`` should contain all historical values and the time points to be predicted,
-        while ``y`` should only contain historical values
-        not the time points to be predicted.
-
-        If ``y`` is None, non global forecast will be performed.
-        In non global forecast mode,
-        ``X`` should only contain the time points to be predicted,
-        while ``y`` should only contain historical values
-        not the time points to be predicted.
         """
+        # Filter out total levels from both y and X for prediction
+        if y is not None:
+            y = self._filter_total_levels(y)
+        if X is not None:
+            X = self._filter_total_levels(X)
+
         X, y = self._Xy_precheck(X, y)
         # convert series to frame
         _y, self._convert_to_series = _series_to_frame(y)
